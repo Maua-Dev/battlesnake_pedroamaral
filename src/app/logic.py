@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 import logging
+import random
 from typing import Iterable
 
 from .models import GameState, MoveResponse
@@ -20,17 +21,20 @@ DELTAS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# API obrigatória do template
+# ---------------------------------------------------------------------------
 
 
 def info() -> dict:
     """GET / — informações visuais e metadados da cobra."""
     return {
         "apiversion": "1",
-        "author": "PedroAAmaral",          
+        "author": "PedroAAmaral",  # seu usuário do Battlesnake
         "color": "#8B0000",
         "head": "tiger-king",
         "tail": "hook",
-        "version": "2.0.0",
+        "version": "3.1.0",
     }
 
 
@@ -45,9 +49,47 @@ def end(state: GameState) -> None:
 
 
 def get_move(state: GameState) -> MoveResponse:
-    """POST /move — decide a próxima jogada.
+    """POST /move — devolve a jogada, com rede de segurança.
 
-    A função sempre devolve uma das quatro direções aceitas pela API.
+    Se qualquer parte da estratégia lançar uma exceção, o jogo não fica sem
+    resposta: caímos numa jogada simples (dentro do tabuleiro e fora de corpos).
+    """
+    try:
+        return _choose_move(state)
+    except Exception:
+        logger.exception("MOVE %s: erro na estratégia; usando fallback simples",
+                         getattr(state, "turn", "?"))
+        return MoveResponse(move=_simple_fallback(state))
+
+
+def _simple_fallback(state: GameState) -> str:
+    """Jogada de último recurso, sem depender do resto da estratégia."""
+    try:
+        head = _pos(state.you.body[0])
+        occupied = {_pos(p) for s in state.board.snakes for p in s.body[:-1]}
+        occupied |= {_pos(p) for p in state.you.body[:-1]}
+        ok = [
+            d for d in DIRECTIONS
+            if _inside(_next_position(head, d), state.board.width, state.board.height)
+            and _next_position(head, d) not in occupied
+        ]
+        return random.choice(ok or list(DIRECTIONS))
+    except Exception:
+        return "up"
+
+
+def _choose_move(state: GameState) -> MoveResponse:
+    """Escolhe a jogada usando heurística + lookahead adversarial.
+
+    A ideia é evoluir de:
+        "qual jogada parece melhor agora?"
+    para:
+        "qual jogada continua boa quando um adversário responde da forma mais
+        incômoda possível?"
+
+    O lookahead é propositalmente curto para respeitar a janela de resposta do
+    campeonato. A camada tática continua barata porque simula apenas respostas
+    de um adversário por vez e usa BFS em um tabuleiro pequeno.
     """
 
     board_w = state.board.width
@@ -55,13 +97,11 @@ def get_move(state: GameState) -> MoveResponse:
 
     my_body = [_pos(p) for p in state.you.body]
     if not my_body:
-        # Situação defensiva impossível no jogo normal, mas mantém a API válida.
         return MoveResponse(move="up")
 
     my_head = my_body[0]
-    my_tail = my_body[-1]
-    my_length = _snake_length(state.you)
     my_health = _snake_health(state.you)
+    my_length = len(my_body)
 
     foods = {_pos(p) for p in getattr(state.board, "food", [])}
     hazards = {_pos(p) for p in getattr(state.board, "hazards", [])}
@@ -73,31 +113,29 @@ def get_move(state: GameState) -> MoveResponse:
         if getattr(snake, "id", None) != getattr(state.you, "id", None)
     ]
 
-    # Direção que a cobra está seguindo no momento. É usada só como desempate
-    # / suavização do movimento; nunca supera uma direção perigosa.
     current_direction = _current_direction(my_body)
 
-    # Ocupação rígida para verificar colisão imediata:
-    # - próprio corpo, exceto a cauda (que normalmente sai no próximo turno)
-    # - corpos adversários, exceto cabeça e cauda, que são dinâmicos
-    hard_blocked = set(my_body[:-1])
+    # Corpo atual dos adversários. Mantemos cabeça e cauda fora do conjunto
+    # rígido porque são partes dinâmicas na resolução do turno.
     opponent_soft_tails: set[tuple[int, int]] = set()
     opponent_heads: list[tuple[int, int]] = []
+    opponent_hard_body: set[tuple[int, int]] = set()
+    opponent_head_cells: set[tuple[int, int]] = set()
 
     for enemy in opponents:
         body = [_pos(p) for p in enemy.body]
         if not body:
             continue
-
-        if len(body) == 1:
-            opponent_heads.append(body[0])
-        else:
-            opponent_heads.append(body[0])
-            hard_blocked.update(body[1:-1])
+        opponent_heads.append(body[0])
+        if len(body) >= 2:
             opponent_soft_tails.add(body[-1])
+            opponent_hard_body.update(body[1:-1])
+            # A cabeça atual vira o pescoço no próximo turno.
+            opponent_head_cells.add(body[0])
 
-    # Primeiro passamos por uma camada de segurança. Uma direção que perde a
-    # cabeça contra uma cobra maior/igual não entra na lista de candidatas normais.
+    # -----------------------------------------------------------------------
+    # 1) Geração de jogadas legalmente possíveis.
+    # -----------------------------------------------------------------------
     candidates: list[dict] = []
 
     for direction in DIRECTIONS:
@@ -106,106 +144,106 @@ def get_move(state: GameState) -> MoveResponse:
         if not _inside(candidate, board_w, board_h):
             continue
 
-        # Recuar sobre o pescoço/próprio corpo continua proibido.
-        if candidate in hard_blocked:
+        # Não voltar sobre o pescoço nem entrar em trecho interno do próprio corpo.
+        if candidate in set(my_body[:-1]):
             continue
 
-        # Colidir de frente com corpo adversário é morte certa. Cabeça e cauda
-        # são tratadas separadamente por serem dinâmicas.
-        if candidate in _opponent_hard_body(opponents):
+        # Entrar na própria cauda só é seguro quando ela realmente vai sair. Se
+        # houver comida na cauda, a cobra cresce e a cauda permanece.
+        if len(my_body) >= 2 and candidate == my_body[-1] and candidate in foods:
             continue
 
-        # Entrar no corpo da própria cauda é tratado como possível porque ela
-        # normalmente será removida no mesmo turno. Isso não vale para um trecho
-        # interno do corpo, que já foi bloqueado acima.
+        # Corpo interno adversário é colisão direta. Cabeça e cauda passam pela
+        # camada tática porque podem gerar head-to-head / tail movement.
+        if candidate in opponent_hard_body:
+            continue
+
+        # Entrar na casa onde a cabeça de um rival está agora é colisão CERTA:
+        # ela vira o pescoço dele depois do movimento (nunca é um head-to-head).
+        if candidate in opponent_head_cells:
+            continue
 
         ate_food = candidate in foods
-        health_after = _health_after_move(my_health, candidate, ate_food, hazards, hazard_damage)
+        health_after = _health_after_move(
+            my_health, candidate, ate_food, hazards, hazard_damage
+        )
 
-        # Se a jogada termina o turno sem comida e zera a vida, é uma jogada perdida.
         if health_after <= 0 and not ate_food:
             continue
 
-        # Head-to-head: se uma adversária maior ou igual puder ir exatamente para
-        # a casa que estamos escolhendo, nossa jogada é considerada ruim.
-        head_threat, attack_value = _head_to_head_values(
+        # Head-to-head imediato. Se uma cobra pelo menos tão grande pode entrar
+        # na mesma casa, a jogada deixa de ser candidata normal.
+        immediate_head_risk, immediate_attack = _head_to_head_values(
             candidate,
             state.you,
             opponents,
             board_w,
             board_h,
-            hard_blocked,
+            set(my_body[:-1]),
             my_body,
         )
 
-        if head_threat >= 100:
-            continue
+        # Jogada com risco de head-to-head perdido NÃO é descartada: vira "plano B".
+        # Uma jogada arriscada (talvez morra) é melhor que uma sem saída (morre).
+        risky_head = immediate_head_risk >= 100
 
-        # Corpo futuro da nossa cobra após esta jogada. Se houver comida, o
-        # tamanho aumenta e a cauda antiga permanece.
         future_my_body = _future_body(my_body, candidate, ate_food)
-        future_occupied = set(future_my_body)
+        future_blocked = set(future_my_body[:-1]) | opponent_hard_body
 
-        # Área que ainda conseguimos alcançar depois de entrar na casa.
-        # Para espaço, cabeças/caudas inimigas são consideradas dinâmicas e não
-        # viram paredes rígidas.
-        future_static_blocked = set(future_occupied)
-        for enemy in opponents:
-            enemy_body = [_pos(p) for p in enemy.body]
-            if len(enemy_body) >= 2:
-                future_static_blocked.update(enemy_body[1:-1])
-
-        free_area = _flood_fill(candidate, future_static_blocked, board_w, board_h)
-        mobility = _count_moves(candidate, future_static_blocked, board_w, board_h)
-
-        # Olhamos mais um turno à frente. Isso evita escolher uma casa que parece
-        # boa agora, mas transforma-se em beco sem saída na jogada seguinte.
+        free_area = _flood_fill(
+            candidate, future_blocked, board_w, board_h
+        )
+        mobility = _count_moves(
+            candidate, future_blocked, board_w, board_h
+        )
+        tail_access = _tail_access_score(
+            future_my_body,
+            future_blocked,
+            board_w,
+            board_h,
+        )
+        bottleneck_penalty = _bottleneck_penalty(
+            free_area,
+            mobility,
+            len(future_my_body),
+            board_w,
+            board_h,
+        )
         lookahead_area = _lookahead_space(
             future_my_body,
             opponents,
-            foods,
+            foods - ({candidate} if ate_food else set()),
             board_w,
             board_h,
         )
-
-        # Território: estima quantas casas ficam mais próximas de nós do que das
-        # cabeças adversárias, usando uma busca simultânea em toda a arena.
         territory = _territory_score(
             candidate,
             opponent_heads,
-            future_static_blocked,
+            future_blocked,
             board_w,
             board_h,
         )
 
-        # Comida: usa caminho real na grade, não somente distância Manhattan.
-        # A prioridade sobe conforme a saúde fica menor.
         food_score, nearest_food_distance = _food_score(
             candidate,
             my_health,
             foods,
             opponents,
-            future_static_blocked,
+            future_blocked,
             board_w,
             board_h,
             ate_food,
         )
 
-        # Risco leve de pegar uma cauda adversária que pode desaparecer, mas que
-        # também pode permanecer se a cobra comer naquele turno.
-        tail_risk = 8 if candidate in opponent_soft_tails else 0
-
-        # Pressão territorial: se a nossa nova cabeça/corpo reduz as saídas de uma
-        # cobra menor, isso cria uma oportunidade de encurralamento.
+        tail_risk = 8.0 if candidate in opponent_soft_tails else 0.0
         pressure_score = _attack_pressure_score(
             future_my_body,
             my_length,
             opponents,
             board_w,
             board_h,
-            hard_blocked,
+            set(my_body[:-1]),
         )
-
         hazard_penalty = _hazard_penalty(
             candidate,
             ate_food,
@@ -213,118 +251,136 @@ def get_move(state: GameState) -> MoveResponse:
             hazards,
             hazard_damage,
         )
-
-        # Parede não é somente "não sair do tabuleiro": ficar encostado demais
-        # reduz as opções futuras.
         wall_penalty = _wall_penalty(candidate, board_w, board_h)
+        straight_bonus = 2.0 if direction == current_direction else 0.0
 
-        # Pequeno incentivo para manter a direção atual e reduzir zigue-zague.
-        straight_bonus = 2 if direction == current_direction else 0
+        # Corrida pela comida: uma comida muito disputada vale menos que parece.
+        food_race_penalty = _food_race_penalty(
+            candidate,
+            foods - ({candidate} if ate_food else set()),
+            opponents,
+            future_blocked,
+            board_w,
+            board_h,
+            my_health,
+        )
 
-        # Quanto mais espaço, melhor. Em tabuleiros pequenos, a área é uma das
-        # métricas mais importantes de sobrevivência.
-        area_score = (free_area / max(1, board_w * board_h)) * 70
-
-        mobility_score = mobility * 5
-        lookahead_score = (lookahead_area / max(1, board_w * board_h)) * 35
+        area_score = (free_area / max(1, board_w * board_h)) * 70.0
+        mobility_score = mobility * 5.0
+        lookahead_score = (lookahead_area / max(1, board_w * board_h)) * 35.0
         territory_score = territory * 0.12
 
-        # O perigo de cabeça pode ser negativo (risco) ou zero; attack_value é
-        # uma recompensa pequena por pressionar uma adversária menor.
-        total_score = (
+        base_score = (
             area_score
             + mobility_score
             + lookahead_score
             + territory_score
             + food_score
-            + attack_value
+            + immediate_attack
             + pressure_score
+            + tail_access
             + straight_bonus
-            - head_threat
+            - immediate_head_risk
             - tail_risk
             - hazard_penalty
             - wall_penalty
+            - food_race_penalty
+            - bottleneck_penalty
         )
+
+        # -------------------------------------------------------------------
+        # 2) Lookahead adversarial.
+        # -------------------------------------------------------------------
+        tactical_score = _adversarial_lookahead(
+            my_body=my_body,
+            my_health=my_health,
+            my_length=my_length,
+            direction=direction,
+            opponents=opponents,
+            foods=foods,
+            hazards=hazards,
+            hazard_damage=hazard_damage,
+            width=board_w,
+            height=board_h,
+        )
+
+        # A heurística atual continua tendo peso maior: o lookahead é uma camada
+        # de correção tática, e não uma busca profunda que possa estourar o timeout.
+        total_score = base_score + tactical_score
 
         candidates.append(
             {
                 "move": direction,
+                "risky": risky_head,
                 "score": total_score,
+                "base_score": base_score,
+                "tactical_score": tactical_score,
                 "area": free_area,
                 "mobility": mobility,
                 "territory": territory,
                 "food_distance": nearest_food_distance,
-                "attack": attack_value,
-                "head_risk": head_threat,
+                "attack": immediate_attack,
+                "head_risk": immediate_head_risk,
                 "hazard": hazard_penalty,
                 "wall": wall_penalty,
             }
         )
 
-    # Normalmente chegaremos aqui com pelo menos uma boa jogada.
     if candidates:
-        # max() é determinístico: em empate mantém a primeira direção de DIRECTIONS.
-        chosen_data = max(candidates, key=lambda item: item["score"])
+        # DIRECTIONS é uma tupla fixa, então o empate permanece determinístico.
+        # Jogadas sem risco de head-to-head têm prioridade; as arriscadas só
+        # entram na disputa quando não existe nenhuma segura.
+        safe_candidates = [c for c in candidates if not c["risky"]]
+        pool = safe_candidates or candidates
+        chosen_data = max(pool, key=lambda item: item["score"])
         chosen = chosen_data["move"]
 
-        logger.debug(
-            "MOVE %d -> %s | score=%.2f area=%d mobility=%d territory=%d food_dist=%s head_risk=%.2f",
+        logger.info(
+            "MOVE %d -> %s | total=%.2f base=%.2f tactical=%.2f area=%d mob=%d territory=%d food=%s head_risk=%.2f",
             state.turn,
             chosen,
             chosen_data["score"],
+            chosen_data["base_score"],
+            chosen_data["tactical_score"],
             chosen_data["area"],
             chosen_data["mobility"],
             chosen_data["territory"],
             chosen_data["food_distance"],
             chosen_data["head_risk"],
         )
-
         return MoveResponse(move=chosen)
 
     # -----------------------------------------------------------------------
-    # Último recurso: estamos encurralados.
-    # Escolhemos a direção com melhor pontuação mesmo sabendo que ela é ruim,
-    # em vez de sortear cegamente.
+    # Último recurso. O cenário normal nunca chega aqui, mas, se todas as
+    # direções seguras desaparecerem, escolhemos deterministicamente a menos
+    # ruim em vez de usar aleatoriedade.
     # -----------------------------------------------------------------------
-    fallback_data: list[dict] = []
+    fallback: list[tuple[float, str]] = []
 
     for direction in DIRECTIONS:
         candidate = _next_position(my_head, direction)
         if not _inside(candidate, board_w, board_h):
             continue
 
-        if candidate in hard_blocked:
-            continue
+        score = 0.0
+        if candidate in set(my_body[:-1]):
+            score -= 1000.0
+        if candidate in opponent_hard_body:
+            score -= 1200.0
+        if candidate in hazards:
+            score -= 50.0
 
-        # Penalização pesada para colisões claras.
-        penalty = 0
-        if candidate in _opponent_hard_body(opponents):
-            penalty += 1000
-
-        head_threat, attack_value = _head_to_head_values(
+        future_body = _future_body(my_body, candidate, False)
+        area = _flood_fill(
             candidate,
-            state.you,
-            opponents,
+            set(future_body[:-1]) | opponent_hard_body,
             board_w,
             board_h,
-            hard_blocked,
-            my_body,
         )
+        score += area * 10.0
+        fallback.append((score, direction))
 
-        area = _flood_fill(candidate, future_block_for_fallback(candidate, my_body, opponents), board_w, board_h)
-        fallback_data.append(
-            {
-                "move": direction,
-                "score": area * 10 + attack_value - head_threat - penalty,
-            }
-        )
-
-    if fallback_data:
-        chosen = max(fallback_data, key=lambda item: item["score"])["move"]
-    else:
-        # Só ocorre em uma posição inválida/inesperada. Mantém a resposta válida.
-        chosen = current_direction or "up"
-
+    chosen = max(fallback)[1] if fallback else (current_direction or "up")
     logger.info("MOVE %d: situação de emergência -> %s", state.turn, chosen)
     return MoveResponse(move=chosen)
 
@@ -358,7 +414,9 @@ def _hazard_damage(state: GameState) -> int:
     try:
         return int(state.game.ruleset.settings.hazardDamagePerTurn)
     except (AttributeError, TypeError, ValueError):
-        return 0
+        # Se há hazards mas a regra não veio no estado, usa o padrão do Royale (14);
+        # subestimar o dano faz a cobra entrar em zonas que a matam de fome.
+        return 14 if getattr(state.board, "hazards", None) else 0
 
 
 def _next_position(position: tuple[int, int], direction: str) -> tuple[int, int]:
@@ -798,6 +856,154 @@ def _food_score(
     return score, distance
 
 
+
+
+def _tail_access_score(
+    body: list[tuple[int, int]],
+    blocked: set[tuple[int, int]],
+    width: int,
+    height: int,
+) -> float:
+    """Premia posições que mantêm um caminho de fuga até a própria cauda."""
+    if len(body) < 2:
+        return 0.0
+
+    head = body[0]
+    tail = body[-1]
+    if head == tail:
+        return 0.0
+
+    queue = deque([(head, 0)])
+    visited = {head}
+    blocked_local = set(blocked)
+    blocked_local.discard(tail)
+    blocked_local.discard(head)
+
+    while queue:
+        position, distance = queue.popleft()
+        if position == tail:
+            # Quanto menor a distância até a cauda, mais opções temos para
+            # prolongar a partida em situações de aperto.
+            return max(3.0, 18.0 - distance * 1.5)
+
+        x, y = position
+        for dx, dy in DELTAS.values():
+            nxt = x + dx, y + dy
+            if not _inside(nxt, width, height):
+                continue
+            if nxt in visited or nxt in blocked_local:
+                continue
+            visited.add(nxt)
+            queue.append((nxt, distance + 1))
+
+    return -15.0
+
+
+def _bottleneck_penalty(
+    area: int,
+    mobility: int,
+    length: int,
+    width: int,
+    height: int,
+) -> float:
+    """Penaliza entrar em regiões pequenas com poucas saídas.
+
+    O critério principal é o espaço comparado ao TAMANHO da cobra: se não cabe o
+    próprio corpo, a cobra está presa, seja ela curta ou longa.
+    """
+    if mobility == 0:
+        return 80.0
+
+    penalty = 0.0
+
+    if mobility == 1:
+        penalty += 24.0
+    elif mobility == 2 and area <= max(5, length * 2):
+        penalty += 15.0
+
+    if area < length:
+        penalty += 40.0          # não cabe o corpo: praticamente um beco fatal
+    elif area < length * 1.5:
+        penalty += 15.0          # cabe, mas sobra pouco
+
+    return min(70.0, penalty)
+
+
+def _food_race_penalty(
+    candidate: tuple[int, int],
+    foods: set[tuple[int, int]],
+    opponents,
+    blocked: set[tuple[int, int]],
+    width: int,
+    height: int,
+    my_health: int,
+) -> float:
+    """Reduz a atração de comida que um adversário deve alcançar primeiro.
+
+    A distância usada é BFS, então paredes e corpos entram na conta. Isso evita
+    tratar uma comida que está "perto em linha reta", mas atrás de um corredor,
+    como uma corrida simples.
+    """
+    if not foods or not opponents:
+        return 0.0
+
+    my_distance = _nearest_food_distance(
+        candidate, foods, blocked, width, height
+    )
+    if my_distance is None:
+        return 0.0
+
+    penalty = 0.0
+
+    for food in foods:
+        # Só analisamos alimentos que podem corresponder ao caminho mais curto
+        # encontrado a partir da nossa candidata.
+        food_distance = _nearest_food_distance(
+            candidate, {food}, blocked, width, height
+        )
+        if food_distance is None or food_distance != my_distance:
+            continue
+
+        for enemy in opponents:
+            body = [_pos(p) for p in getattr(enemy, "body", [])]
+            if not body:
+                continue
+
+            enemy_head = body[0]
+            enemy_blocked = set()
+            if len(body) >= 2:
+                enemy_blocked.update(body[:-1])
+
+            # Não usamos a nossa futura cabeça como bloqueio para o cálculo da
+            # corrida; a competição pela casa é tratada como risco tático.
+            enemy_distance = _nearest_food_distance(
+                enemy_head,
+                {food},
+                enemy_blocked,
+                width,
+                height,
+            )
+
+            if enemy_distance is None:
+                continue
+
+            if enemy_distance < food_distance:
+                penalty += 11.0
+            elif enemy_distance == food_distance:
+                penalty += 6.0
+            elif enemy_distance == food_distance + 1:
+                penalty += 2.5
+
+    # A comida é mais importante conforme a saúde cai, então reduzimos a
+    # penalização quando estamos perto de morrer de fome.
+    if my_health <= 25:
+        penalty *= 0.45
+    elif my_health <= 45:
+        penalty *= 0.70
+
+    return min(30.0, penalty)
+
+
 def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
@@ -835,6 +1041,440 @@ def _wall_penalty(
     if nearest == 1:
         return 6.0
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Lookahead adversarial / simulação tática
+# ---------------------------------------------------------------------------
+
+
+def _adversarial_lookahead(
+    *,
+    my_body: list[tuple[int, int]],
+    my_health: int,
+    my_length: int,
+    direction: str,
+    opponents,
+    foods: set[tuple[int, int]],
+    hazards: set[tuple[int, int]],
+    hazard_damage: int,
+    width: int,
+    height: int,
+) -> float:
+    """Faz um minimax tático raso: nós escolhemos a jogada, um inimigo responde.
+
+    Não tenta enumerar todas as combinações simultâneas de todas as cobras,
+    porque isso explode rapidamente. Em vez disso, para cada inimigo avaliamos
+    suas respostas e consideramos a pior resposta individual. Isso já captura
+    boa parte dos problemas que uma avaliação puramente local não percebe:
+    corredor fechado, fuga cortada, pressão de cabeça e perda do acesso à comida.
+    """
+    destination = _next_position(my_body[0], direction)
+    ate_food = destination in foods
+
+    after_me = _future_body(my_body, destination, ate_food)
+    after_me_health = _health_after_move(
+        my_health, destination, ate_food, hazards, hazard_damage
+    )
+
+    if after_me_health <= 0 and not ate_food:
+        return -900.0
+
+    remaining_food = foods - ({destination} if ate_food else set())
+    if not opponents:
+        # Mesmo sem inimigos, valorizamos a qualidade da próxima posição.
+        return 0.35 * _next_state_value(
+            after_me,
+            after_me_health,
+            opponents,
+            remaining_food,
+            hazards,
+            hazard_damage,
+            width,
+            height,
+        )
+
+    worst_response = float("inf")
+    saw_response = False
+
+    # Os adversários são avaliados separadamente. A menor nota é a ameaça que
+    # conseguimos identificar com a nossa visão rasa.
+    for enemy_index, enemy in enumerate(opponents):
+        enemy_body = [_pos(p) for p in getattr(enemy, "body", [])]
+        if not enemy_body:
+            continue
+
+        enemy_health = _snake_health(enemy)
+        enemy_length = len(enemy_body)
+        enemy_head = enemy_body[0]
+        enemy_reverse = _current_direction(enemy_body)
+
+        for enemy_direction in DIRECTIONS:
+            if enemy_reverse is not None and enemy_direction == _opposite(enemy_reverse):
+                continue
+
+            enemy_destination = _next_position(enemy_head, enemy_direction)
+            if not _inside(enemy_destination, width, height):
+                continue
+
+            # Movimento adversário sem a nossa resposta. Colisões são resolvidas
+            # depois; isso permite considerar head-to-head e entradas em corpo.
+            enemy_ate = enemy_destination in remaining_food
+            after_enemy = _future_body(enemy_body, enemy_destination, enemy_ate)
+            after_enemy_health = _health_after_move(
+                enemy_health,
+                enemy_destination,
+                enemy_ate,
+                hazards,
+                hazard_damage,
+            )
+
+            # As outras cobras continuam estáticas nesta aproximação. Para a
+            # nossa sobrevivência, seus corpos internos são obstáculos.
+            other_bodies = set()
+            for j, other in enumerate(opponents):
+                if j == enemy_index:
+                    continue
+                body = [_pos(p) for p in getattr(other, "body", [])]
+                if len(body) >= 2:
+                    other_bodies.update(body[1:-1])
+
+            ours_alive, enemy_alive = _resolve_tactical_collision(
+                our_body=after_me,
+                our_health=after_me_health,
+                enemy_body=after_enemy,
+                enemy_health=after_enemy_health,
+                enemy_length=len(after_enemy),
+                static_bodies=other_bodies,
+                width=width,
+                height=height,
+            )
+
+            saw_response = True
+
+            if not ours_alive:
+                response_value = -1000.0
+            else:
+                response_value = _next_state_value(
+                    after_me,
+                    after_me_health,
+                    [
+                        _EnemySnapshot(
+                            body=after_enemy,
+                            health=after_enemy_health,
+                            length=len(after_enemy),
+                            alive=enemy_alive,
+                        )
+                    ],
+                    remaining_food - ({enemy_destination} if enemy_ate else set()),
+                    hazards,
+                    hazard_damage,
+                    width,
+                    height,
+                )
+
+                # Se nós comemos e ficamos maiores, uma eliminação imediata do
+                # adversário é boa. Se o adversário sobreviveu e está adjacente,
+                # o próximo turno ainda pode representar uma disputa de cabeça.
+                if not enemy_alive:
+                    response_value += 75.0
+                else:
+                    response_value -= _future_head_threat(
+                        after_me,
+                        enemy_body=[after_enemy[0]],   # só a CABEÇA, não o corpo todo
+                        our_length=len(after_me),
+                        enemy_length=len(after_enemy),
+                        width=width,
+                        height=height,
+                    )
+
+            if response_value < worst_response:
+                worst_response = response_value
+
+    if not saw_response:
+        return 0.35 * _next_state_value(
+            after_me,
+            after_me_health,
+            opponents,
+            remaining_food,
+            hazards,
+            hazard_damage,
+            width,
+            height,
+        )
+
+    # Peso moderado para não destruir a heurística principal em partidas com
+    # muitas cobras. Ainda assim, uma linha que perde em um cenário de resposta
+    # óbvia recebe forte penalização.
+    return max(-260.0, min(95.0, worst_response * 0.70))
+
+
+class _EnemySnapshot:
+    """Pequeno contêiner interno usado só na simulação."""
+
+    __slots__ = ("body", "health", "length", "alive")
+
+    def __init__(self, body, health, length, alive=True):
+        self.body = body
+        self.health = health
+        self.length = length
+        self.alive = alive
+
+
+def _opposite(direction: str) -> str:
+    return {
+        "up": "down",
+        "down": "up",
+        "left": "right",
+        "right": "left",
+    }[direction]
+
+
+def _resolve_tactical_collision(
+    *,
+    our_body: list[tuple[int, int]],
+    our_health: int,
+    enemy_body: list[tuple[int, int]],
+    enemy_health: int,
+    enemy_length: int,
+    static_bodies: set[tuple[int, int]],
+    width: int,
+    height: int,
+) -> tuple[bool, bool]:
+    """Resolve só o que interessa para o lookahead: quem sobrevive ao turno."""
+    if not our_body or not enemy_body:
+        return bool(our_body), bool(enemy_body)
+
+    our_head = our_body[0]
+    enemy_head = enemy_body[0]
+    our_length = len(our_body)
+
+    our_alive = True
+    enemy_alive = True
+
+    if our_health <= 0:
+        our_alive = False
+    if enemy_health <= 0:
+        enemy_alive = False
+
+    # Colisão cabeça-a-cabeça: maior sobrevive; empate elimina as duas.
+    if our_head == enemy_head:
+        if our_length > enemy_length:
+            enemy_alive = False
+        elif our_length < enemy_length:
+            our_alive = False
+        else:
+            our_alive = False
+            enemy_alive = False
+
+    # Cabeça em corpo.
+    if our_alive and our_head in set(enemy_body[1:]):
+        our_alive = False
+    if enemy_alive and enemy_head in set(our_body[1:]):
+        enemy_alive = False
+
+    # Colisão com o PRÓPRIO corpo (um rival não joga para dentro de si mesmo).
+    if our_alive and our_head in set(our_body[1:]):
+        our_alive = False
+    if enemy_alive and enemy_head in set(enemy_body[1:]):
+        enemy_alive = False
+
+    # Colisões com obstáculos estáticos / corpos de outras cobras.
+    static = set(static_bodies)
+    if our_alive and our_head in static:
+        our_alive = False
+    if enemy_alive and enemy_head in static:
+        enemy_alive = False
+
+    # Limites. Já deveriam ter sido filtrados, mas a checagem torna a função
+    # segura para testes unitários e futuras mudanças.
+    if not _inside(our_head, width, height):
+        our_alive = False
+    if not _inside(enemy_head, width, height):
+        enemy_alive = False
+
+    return our_alive, enemy_alive
+
+
+def _next_state_value(
+    my_body: list[tuple[int, int]],
+    health: int,
+    opponents,
+    foods: set[tuple[int, int]],
+    hazards: set[tuple[int, int]],
+    hazard_damage: int,
+    width: int,
+    height: int,
+) -> float:
+    """Valoriza a posição um turno depois da resposta adversária."""
+    if not my_body:
+        return -1000.0
+
+    my_head = my_body[0]
+    occupied = set(my_body[:-1])
+
+    enemy_bodies = []
+    enemy_heads = []
+    enemy_hard = set()
+
+    for enemy in opponents:
+        if not getattr(enemy, "alive", True):
+            continue
+        body = list(getattr(enemy, "body", []))
+        if not body:
+            continue
+        enemy_bodies.append(body)
+        enemy_heads.append(body[0])
+        if len(body) >= 2:
+            enemy_hard.update(body[1:-1])
+
+    static_blocked = occupied | enemy_hard
+
+    legal_next: list[tuple[str, tuple[int, int], int, int]] = []
+    for direction in DIRECTIONS:
+        nxt = _next_position(my_head, direction)
+        if not _inside(nxt, width, height):
+            continue
+        if nxt in occupied:
+            continue
+        if nxt == my_body[-1] and nxt in foods and len(my_body) >= 2:
+            continue
+        if nxt in enemy_hard:
+            continue
+
+        ate = nxt in foods
+        next_body = _future_body(my_body, nxt, ate)
+        next_health = _health_after_move(
+            health,
+            nxt,
+            ate,
+            hazards,
+            hazard_damage,
+        )
+        if next_health <= 0 and not ate:
+            continue
+
+        area = _flood_fill(
+            nxt,
+            set(next_body[:-1]) | enemy_hard,
+            width,
+            height,
+        )
+        mobility = _count_moves(
+            nxt,
+            set(next_body[:-1]) | enemy_hard,
+            width,
+            height,
+        )
+        legal_next.append((direction, nxt, area, mobility))
+
+    if not legal_next:
+        return -700.0
+
+    best = -float("inf")
+    for direction, nxt, area, mobility in legal_next:
+        food_value = 0.0
+        nearest = _nearest_food_distance(
+            nxt,
+            foods,
+            static_blocked,
+            width,
+            height,
+        )
+        if nearest is not None:
+            if health <= 25:
+                food_value = 55.0 / (nearest + 1)
+            elif health <= 50:
+                food_value = 30.0 / (nearest + 1)
+            else:
+                food_value = 12.0 / (nearest + 1)
+
+        territory = _territory_score(
+            nxt,
+            enemy_heads,
+            set(_future_body(my_body, nxt, nxt in foods)[:-1]) | enemy_hard,
+            width,
+            height,
+        )
+
+        head_risk = _future_head_threat(
+            _future_body(my_body, nxt, nxt in foods),
+            enemy_body=enemy_heads,
+            our_length=len(_future_body(my_body, nxt, nxt in foods)),
+            enemy_lengths=[len(body) for body in enemy_bodies],
+            width=width,
+            height=height,
+        ) if enemy_bodies else 0.0
+
+        value = (
+            area * 1.65
+            + mobility * 9.0
+            + territory * 0.30
+            + food_value
+            - head_risk
+        )
+
+        if nxt in hazards and nxt not in foods:
+            value -= 12.0 + hazard_damage * 0.8
+
+        best = max(best, value)
+
+    return best
+
+
+def _future_head_threat(
+    my_body: list[tuple[int, int]],
+    enemy_body,
+    our_length: int,
+    enemy_length=None,
+    enemy_lengths=None,
+    width: int = 0,
+    height: int = 0,
+) -> float:
+    """Penaliza vizinhança imediata de cabeças que podem ganhar o próximo confronto."""
+    if not my_body:
+        return 200.0
+
+    my_head = my_body[0]
+
+    if enemy_body is None:
+        return 0.0
+
+    if enemy_body and isinstance(enemy_body[0], tuple):
+        enemy_heads = list(enemy_body)
+    else:
+        enemy_heads = []
+        for item in enemy_body:
+            body = getattr(item, "body", None)
+            if body:
+                enemy_heads.append(body[0])
+            elif isinstance(item, tuple):
+                enemy_heads.append(item)
+
+    lengths: list[int]
+    if enemy_lengths is not None:
+        lengths = list(enemy_lengths)
+    elif enemy_length is not None:
+        lengths = [int(enemy_length)] * len(enemy_heads)
+    else:
+        lengths = [1] * len(enemy_heads)
+
+    threat = 0.0
+    for index, head in enumerate(enemy_heads):
+        distance = abs(my_head[0] - head[0]) + abs(my_head[1] - head[1])
+        length = lengths[min(index, len(lengths) - 1)] if lengths else 1
+
+        if distance == 1:
+            if length >= our_length:
+                threat += 55.0
+            else:
+                threat -= 8.0
+        elif distance == 2 and length >= our_length:
+            # Menor que o risco adjacente, mas ainda é uma disputa que pode
+            # aparecer no próximo turno dependendo da geometria.
+            threat += 12.0
+
+    return min(90.0, max(-20.0, threat))
 
 
 def future_block_for_fallback(
